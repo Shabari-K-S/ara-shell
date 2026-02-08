@@ -1,0 +1,80 @@
+use ara::{AuraHelper, Lexer, Parser, ShellState, execute};
+use rustyline::Editor;
+use rustyline::error::ReadlineError;
+use rustyline::history::FileHistory;
+use std::env;
+
+fn main() -> anyhow::Result<()> {
+    // Initialize shell state
+    let mut state = ShellState::new();
+
+    // Initialize Rustyline Editor with AuraHelper
+    let mut rl = Editor::<AuraHelper, FileHistory>::new()?;
+    rl.set_helper(Some(AuraHelper {}));
+
+    // Load history
+    // Get home directory for history file
+    let history_path = env::var("HOME").unwrap_or_else(|_| ".".to_string()) + "/.aura_history";
+    if rl.load_history(&history_path).is_err() {
+        // No previous history
+    }
+
+    loop {
+        // Display prompt
+        let cwd = state.cwd.file_name().unwrap_or_default().to_string_lossy();
+        let prompt = format!("aura {} $ ", cwd);
+
+        let readline = rl.readline(&prompt);
+        match readline {
+            Ok(line) => {
+                let command_text = line.trim();
+                if command_text.is_empty() {
+                    continue;
+                }
+
+                rl.add_history_entry(command_text)?;
+
+                // Lex and Parse
+                let lexer = Lexer::new(command_text);
+                let parser_result = Parser::new(lexer).and_then(|mut p| p.parse());
+
+                match parser_result {
+                    Ok(Some(command)) => {
+                        // Execute
+                        match execute(&command, &mut state) {
+                            Ok(code) => {
+                                state.last_exit_code = code;
+                            }
+                            Err(e) => {
+                                eprintln!("Error executing command: {}", e);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("{}", e);
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) => {
+                // Ctrl-C
+                println!("^C");
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                // Ctrl-D
+                println!("exit");
+                break;
+            }
+            Err(err) => {
+                eprintln!("Error: {:?}", err);
+                break;
+            }
+        }
+    }
+
+    // Save history
+    rl.save_history(&history_path)?;
+
+    Ok(())
+}
