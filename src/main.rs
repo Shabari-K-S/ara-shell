@@ -22,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     loop {
         // Display prompt
         let cwd = state.cwd.file_name().unwrap_or_default().to_string_lossy();
-        let prompt = format!("aura {} $ ", cwd);
+        let prompt = format!("\x1b[1;32maura\x1b[0m \x1b[1;36m{}\x1b[0m $ ", cwd);
 
         let readline = rl.readline(&prompt);
         match readline {
