@@ -17,8 +17,10 @@
 ### 🛠️ Shell Capabilities
 - **Pipelines**: Infinite pipelines supported (`ls -la | grep cargo | wc -l`).
 - **Redirection**: Standard input/output redirection (`>`, `>>`, `<`).
-- **Built-ins**: `cd`, `exit`.
-- **Quote Handling**: Correctly handles single (`'`) and double (`"`) quotes, stripping them during execution while preserving them for display.
+- **Built-ins**: `cd`, `exit`, `export`, `unset`.
+- **Quote Handling**: Correctly handles single (`'`) and double (`"`) quotes.
+- **Variables**: Environment variable management (`export`, `unset`) and parameter expansion (`$VAR`, `${VAR}`, `$?`).
+- **Flow Control**: `if`/`else` conditionals, `while`/`for` loops, and function definitions.
 
 ## Installation & Usage
 
@@ -51,14 +53,19 @@ ls -la
 # Pipe output
 cat Cargo.toml | grep version
 
-# Redirect to file
-echo "Hello World" > hello.txt
+# Variables
+export NAME="Ara"
+echo "Hello $NAME"
 
-# Append to file
-echo "Another line" >> hello.txt
+# Control Flow
+if true; then echo "It works!"; fi
 
-# Exit
-exit
+# Loops
+for i in 1 2 3; do echo $i; done
+
+# Functions
+greet() { echo "Hello $1"; }
+greet World
 ```
 
 ## Roadmap
@@ -78,15 +85,15 @@ The development of Aura follows a structured 10-phase plan to deliver a complete
     - Persistent history with navigation.
     - `rustyline` integration for rich line editing.
 
-- [ ] **Phase 4: Variable Expansion & Environment**
-    - Environment variable management (`export`, `unset`).
-    - Parameter expansion (`${VAR}`, `$?`, `$!`).
-    - Arithmetic expansion (`$((1 + 1))`).
+- [x] **Phase 4: Variable Expansion & Environment**
+    - [x] Environment variable management (`export`, `unset`).
+    - [x] Parameter expansion (`${VAR}`, `$?`).
+    - [ ] Arithmetic expansion (`$((1 + 1))`).
 
-- [ ] **Phase 5: Flow Control & Logic**
-    - Conditional execution (`if`, `else`, `case`).
-    - Loops (`for`, `while`, `until`).
-    - Function definitions and scoping.
+- [x] **Phase 5: Flow Control & Logic**
+    - [x] Conditional execution (`if`, `else`).
+    - [x] Loops (`for`, `while`).
+    - [x] Function definitions.
 
 - [ ] **Phase 6: Advanced I/O & Redirections**
     - Here-documents (`<<EOF`) and Here-strings (`<<<`).

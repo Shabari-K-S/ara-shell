@@ -1,3 +1,4 @@
+use crate::ast::Command;
 use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
@@ -13,6 +14,8 @@ pub struct ShellState {
     pub env: HashMap<String, String>,
     // Shell variables (not exported)
     pub vars: HashMap<String, String>,
+    // Functions
+    pub functions: HashMap<String, Command>,
     // Current working directory cache
     pub cwd: PathBuf,
     // Last exit status ($?)
@@ -31,6 +34,7 @@ impl ShellState {
         Self {
             env: env_vars,
             vars: HashMap::new(),
+            functions: HashMap::new(),
             cwd,
             last_exit_code: 0,
             options: ShellOptions::default(),

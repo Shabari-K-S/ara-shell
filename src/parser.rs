@@ -99,7 +99,7 @@ impl<'a> Lexer<'a> {
                 self.advance_char();
                 Ok(Token::Newline)
             }
-            ';' | '|' | '&' | '<' | '>' => {
+            ';' | '|' | '&' | '<' | '>' | '(' | ')' => {
                 self.advance_char();
                 let op = c.to_string();
 
@@ -134,7 +134,7 @@ impl<'a> Lexer<'a> {
                 // Word
                 let mut word = String::new();
                 while let Some(c) = self.peek_char() {
-                    if c.is_whitespace() || ";|&<>".contains(c) {
+                    if c.is_whitespace() || ";|&<>()".contains(c) {
                         break;
                     }
 
@@ -211,25 +211,8 @@ impl<'a> Parser<'a> {
                 };
                 self.advance()?;
 
-                // Allow trailing semicolons/ampersands
-                if self.current_token == Token::EOF {
-                    return Ok(left);
-                }
-
-                // Recursively parse the right side
-                // Note: This is right-associative for now, but lists in shell are complex.
-                // A better approach for "cmd1; cmd2; cmd3" is iteration or left-associativity.
-                // For this phase, let's keep it simple: cmd1 ; (cmd2 ; cmd3)
-                // However, standard shell grammar often treats list as: sequence of pipelines separated by separators.
-
-                // If the next token is EOF after a separator, return left.
-                // But wait, I already did that check.
-
-                // Implementing a loop for flat list structure might be better for iteration,
-                // but AST defines List as binary. Let's stick to recursion.
-
-                // Check if we hit EOF or another closing token (if we had ')' or '}')
-                if matches!(self.current_token, Token::EOF) {
+                // Check for terminators or EOF
+                if matches!(self.current_token, Token::EOF) || self.is_terminator() {
                     return Ok(left);
                 }
 
@@ -244,13 +227,20 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn is_terminator(&self) -> bool {
+        match &self.current_token {
+            Token::Word(w) => matches!(w.as_str(), "then" | "else" | "fi" | "do" | "done" | "}"),
+            _ => false,
+        }
+    }
+
     fn parse_pipeline(&mut self) -> Result<Command, ShellError> {
-        let mut commands = vec![self.parse_simple()?];
+        let mut commands = vec![self.parse_command()?];
 
         while let Token::Operator(op) = &self.current_token {
             if op == "|" {
                 self.advance()?;
-                commands.push(self.parse_simple()?);
+                commands.push(self.parse_command()?);
             } else {
                 break;
             }
@@ -263,13 +253,238 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_simple(&mut self) -> Result<Command, ShellError> {
+    fn parse_command(&mut self) -> Result<Command, ShellError> {
+        match &self.current_token {
+            Token::Word(w) if w == "if" => self.parse_if(),
+            Token::Word(w) if w == "while" => self.parse_while(),
+            Token::Word(w) if w == "for" => self.parse_for(),
+            Token::Word(w) if w == "{" => self.parse_group(),
+            _ => self.parse_simple_command(),
+        }
+    }
+
+    fn parse_group(&mut self) -> Result<Command, ShellError> {
+        self.advance()?; // eat '{'
+        // Skip whitespace/newlines if needed? parse_list handles leading newlines?
+        // No, Lexer handles whitespace. Newlines are tokens.
+        // parse_list calls parse_pipeline calls parse_command.
+        // If first token is Newline, parse_simple_command errors "Expected command...".
+        // BUT '{' usually followed by space/cmd.
+        // `{ \n cmd }` -> valid.
+        // parse_list needs to handle optional leading newlines?
+        // My parser doesn't handle leading newlines well yet.
+        // Bash: `{` command `}`.
+        let list = self.parse_list()?;
+        match &self.current_token {
+            Token::Word(w) if w == "}" => {
+                self.advance()?;
+                Ok(list)
+            }
+            _ => Err(ShellError::Syntax(
+                "Expected '}' at end of block".to_string(),
+            )),
+        }
+    }
+
+    fn parse_for(&mut self) -> Result<Command, ShellError> {
+        self.advance()?; // eat 'for'
+
+        let variable = match &self.current_token {
+            Token::Word(w) => w.clone(),
+            _ => {
+                return Err(ShellError::Syntax(
+                    "Expected variable name after for".to_string(),
+                ));
+            }
+        };
+        self.advance()?;
+
+        let mut items = Vec::new();
+
+        // Check for 'in'
+        match &self.current_token {
+            Token::Word(w) if w == "in" => {
+                self.advance()?; // eat 'in'
+
+                loop {
+                    match &self.current_token {
+                        Token::Word(w) if w == "do" => break,
+                        Token::Operator(op) if op == ";" => {
+                            self.advance()?;
+                            break;
+                        }
+                        Token::Newline => {
+                            self.advance()?;
+                            break;
+                        }
+                        Token::Word(w) => {
+                            items.push(w.clone());
+                            self.advance()?;
+                        }
+                        Token::Operator(_) => break, // e.g. | or & - unexpected usually
+                        _ => break,
+                    }
+                }
+            }
+            // If no 'in', maybe just 'do' (iterate args - functionality for later)
+            Token::Word(w) if w == "do" => {
+                // No items provided? In bash this iterates over $@.
+                // For now let's assume empty list or implement $@ logic later.
+            }
+            Token::Operator(op) if op == ";" => {
+                self.advance()?;
+            }
+            Token::Newline => {
+                self.advance()?;
+            }
+            _ => {
+                return Err(ShellError::Syntax(
+                    "Expected 'in' or 'do' in for loop".to_string(),
+                ));
+            }
+        }
+
+        // consume any extra separators before 'do'
+        while match &self.current_token {
+            Token::Operator(op) if op == ";" => true,
+            Token::Newline => true,
+            _ => false,
+        } {
+            self.advance()?;
+        }
+
+        match &self.current_token {
+            Token::Word(w) if w == "do" => self.advance()?,
+            _ => return Err(ShellError::Syntax("Expected 'do' in for loop".to_string())),
+        };
+
+        let body = self.parse_list()?;
+
+        match &self.current_token {
+            Token::Word(w) if w == "done" => self.advance()?,
+            _ => {
+                return Err(ShellError::Syntax(
+                    "Expected 'done' at end of for loop".to_string(),
+                ));
+            }
+        };
+
+        Ok(Command::For {
+            variable,
+            items,
+            body: Box::new(body),
+        })
+    }
+
+    fn parse_if(&mut self) -> Result<Command, ShellError> {
+        self.advance()?; // eat 'if'
+        let condition = self.parse_list()?;
+
+        match &self.current_token {
+            Token::Word(w) if w == "then" => self.advance()?,
+            _ => {
+                return Err(ShellError::Syntax(
+                    "Expected 'then' after if condition".to_string(),
+                ));
+            }
+        };
+
+        let then_body = self.parse_list()?;
+
+        let else_body = match &self.current_token {
+            Token::Word(w) if w == "else" => {
+                self.advance()?;
+                Some(Box::new(self.parse_list()?))
+            }
+            _ => None,
+        };
+
+        match &self.current_token {
+            Token::Word(w) if w == "fi" => self.advance()?,
+            _ => {
+                return Err(ShellError::Syntax(
+                    "Expected 'fi' at end of if statement".to_string(),
+                ));
+            }
+        };
+
+        Ok(Command::If {
+            condition: Box::new(condition),
+            then_body: Box::new(then_body),
+            else_body,
+        })
+    }
+
+    fn parse_while(&mut self) -> Result<Command, ShellError> {
+        self.advance()?; // eat 'while'
+        let condition = self.parse_list()?;
+
+        match &self.current_token {
+            Token::Word(w) if w == "do" => self.advance()?,
+            _ => {
+                return Err(ShellError::Syntax(
+                    "Expected 'do' after while condition".to_string(),
+                ));
+            }
+        };
+
+        let body = self.parse_list()?;
+
+        match &self.current_token {
+            Token::Word(w) if w == "done" => self.advance()?,
+            _ => {
+                return Err(ShellError::Syntax(
+                    "Expected 'done' at end of while loop".to_string(),
+                ));
+            }
+        };
+
+        Ok(Command::While {
+            condition: Box::new(condition),
+            body: Box::new(body),
+        })
+    }
+
+    fn parse_simple_command(&mut self) -> Result<Command, ShellError> {
         let mut args = Vec::new();
         let mut redirects = Vec::new();
 
         loop {
             match &self.current_token {
                 Token::Word(w) => {
+                    // Check for function def start: name ( )
+                    if args.is_empty() && redirects.is_empty() {
+                        let name = w.clone();
+                        self.advance()?; // eat name
+
+                        // Check if next is '('
+                        if let Token::Operator(op) = &self.current_token {
+                            if op == "(" {
+                                self.advance()?; // eat '('
+
+                                // Expect ')'
+                                match &self.current_token {
+                                    Token::Operator(op) if op == ")" => self.advance()?,
+                                    _ => {
+                                        return Err(ShellError::Syntax(
+                                            "Expected ')' in function definition".to_string(),
+                                        ));
+                                    }
+                                };
+
+                                let body = self.parse_command()?;
+                                return Ok(Command::FunctionDef {
+                                    name,
+                                    body: Box::new(body),
+                                });
+                            }
+                        }
+
+                        // Not a function def
+                        args.push(name);
+                        continue;
+                    }
+
                     args.push(w.clone());
                     self.advance()?;
                 }
@@ -303,9 +518,12 @@ impl<'a> Parser<'a> {
         }
 
         if args.is_empty() && redirects.is_empty() {
-            return Err(ShellError::Syntax(
-                "Expected command, found nothing".to_string(),
-            ));
+            // It's possible we came here but found a terminator immediately?
+            // "if true; then fi" -> Empty body?
+            return Err(ShellError::Syntax(format!(
+                "Expected command, found {:?}",
+                self.current_token
+            )));
         }
 
         Ok(Command::Simple {
@@ -397,6 +615,70 @@ mod tests {
                 assert_eq!(op, crate::ast::ControlOp::And);
             }
             _ => panic!("Expected list"),
+        }
+    }
+
+    #[test]
+    fn test_parser_if() {
+        let input = "if true; then echo yes; else echo no; fi";
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer).unwrap();
+        let cmd = parser.parse().unwrap();
+
+        match cmd {
+            Some(Command::If {
+                condition: _,
+                then_body: _,
+                else_body,
+            }) => {
+                assert!(else_body.is_some());
+            }
+            _ => panic!("Expected if command, got {:?}", cmd),
+        }
+    }
+
+    #[test]
+    fn test_parser_while() {
+        let input = "while true; do echo loop; done";
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer).unwrap();
+        let cmd = parser.parse().unwrap();
+
+        match cmd {
+            Some(Command::While { .. }) => {}
+            _ => panic!("Expected while command"),
+        }
+    }
+    #[test]
+    fn test_parser_for() {
+        let input = "for i in a b c; do echo $i; done";
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer).unwrap();
+        let cmd = parser.parse().unwrap();
+
+        match cmd {
+            Some(Command::For {
+                variable, items, ..
+            }) => {
+                assert_eq!(variable, "i");
+                assert_eq!(items, vec!["a", "b", "c"]);
+            }
+            _ => panic!("Expected for command"),
+        }
+    }
+
+    #[test]
+    fn test_parser_function() {
+        let input = "foo() { echo bar; }";
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer).unwrap();
+        let cmd = parser.parse().unwrap();
+
+        match cmd {
+            Some(Command::FunctionDef { name, body: _ }) => {
+                assert_eq!(name, "foo");
+            }
+            _ => panic!("Expected function def"),
         }
     }
 }

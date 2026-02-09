@@ -18,6 +18,28 @@ pub enum Command {
     },
     // A subshell: "( cd /tmp; ls )"
     Subshell(Box<Command>),
+    // If command: "if ...; then ...; else ...; fi"
+    If {
+        condition: Box<Command>,
+        then_body: Box<Command>,
+        else_body: Option<Box<Command>>,
+    },
+    // While command: "while ...; do ...; done"
+    While {
+        condition: Box<Command>,
+        body: Box<Command>,
+    },
+    // For command: "for var in a b c; do ...; done"
+    For {
+        variable: String,
+        items: Vec<String>,
+        body: Box<Command>,
+    },
+    // Function definition: "foo() { ... }"
+    FunctionDef {
+        name: String,
+        body: Box<Command>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

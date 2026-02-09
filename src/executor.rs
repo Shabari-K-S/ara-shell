@@ -25,8 +25,89 @@ pub fn execute(cmd: &Command, state: &mut ShellState) -> Result<i32, ExecError> 
         } => execute_simple(args, redirects, state),
         Command::Pipeline(cmds) => execute_pipeline(cmds, state),
         Command::List { left, op, right } => execute_list(left, op, right, state),
+        Command::If {
+            condition,
+            then_body,
+            else_body,
+        } => execute_if(condition, then_body, else_body, state),
+        Command::While { condition, body } => execute_while(condition, body, state),
+        Command::For {
+            variable,
+            items,
+            body,
+        } => execute_for(variable, items, body, state),
+        Command::FunctionDef { name, body } => execute_function_def(name, body, state),
         _ => Ok(0), // TODO: Subshell
     }
+}
+
+fn execute_function_def(
+    name: &str,
+    body: &Command,
+    state: &mut ShellState,
+) -> Result<i32, ExecError> {
+    state.functions.insert(name.to_string(), body.clone());
+    Ok(0)
+}
+
+fn execute_if(
+    condition: &Command,
+    then_body: &Command,
+    else_body: &Option<Box<Command>>,
+    state: &mut ShellState,
+) -> Result<i32, ExecError> {
+    let cond_status = execute(condition, state)?;
+    if cond_status == 0 {
+        execute(then_body, state)
+    } else if let Some(else_cmd) = else_body {
+        execute(else_cmd, state)
+    } else {
+        Ok(0)
+    }
+}
+
+fn execute_while(
+    condition: &Command,
+    body: &Command,
+    state: &mut ShellState,
+) -> Result<i32, ExecError> {
+    let mut last_status = 0;
+    loop {
+        let cond_status = execute(condition, state)?;
+        if cond_status == 0 {
+            last_status = execute(body, state)?;
+        } else {
+            break;
+        }
+    }
+    Ok(last_status)
+}
+
+fn execute_for(
+    variable: &str,
+    items: &[String],
+    body: &Command,
+    state: &mut ShellState,
+) -> Result<i32, ExecError> {
+    let mut last_status = 0;
+    // Todo: expand items here if needed (e.g. $LIST -> "a", "b", "c")
+    // For now, assuming items are already split or we don't support splitting yet.
+    // But we SHOULD expand variables.
+
+    // Expand items
+    let mut expanded_items = Vec::new();
+    for item in items {
+        // Simple expansion: expand_arg returns one string.
+        // Standard shell would split this string by IFS.
+        // We skip splitting for now.
+        expanded_items.push(expand_arg(item, state));
+    }
+
+    for item in expanded_items {
+        state.env.insert(variable.to_string(), item);
+        last_status = execute(body, state)?;
+    }
+    Ok(last_status)
 }
 
 fn execute_simple(
@@ -38,12 +119,29 @@ fn execute_simple(
         return Ok(0);
     }
 
-    let program = &args[0];
+    // Expand arguments
+    let mut expanded_args = Vec::new();
+    for arg in args {
+        expanded_args.push(expand_arg(arg, state));
+    }
+
+    let program = &expanded_args[0];
+
+    // Check for functions
+    if let Some(body) = state.functions.get(program).cloned() {
+        // Execute function body.
+        // TODO: Handle arguments ($1, $2...)
+        // For now just execute body with current state.
+        return match execute(&body, state) {
+            Ok(code) => Ok(code),
+            Err(e) => Err(ExecError::General(e.to_string())),
+        };
+    }
 
     // Check for built-ins
     if let Some(builtin) = get_builtin(program) {
         // TODO: Redirects for builtins? (Maybe later)
-        match builtin.execute(args, state) {
+        match builtin.execute(&expanded_args, state) {
             Ok(code) => return Ok(code),
             Err(e) => return Err(ExecError::General(e.to_string())),
         }
@@ -69,7 +167,7 @@ fn execute_simple(
             }
 
             let c_program = CString::new(program.clone()).unwrap();
-            let c_args: Vec<CString> = args
+            let c_args: Vec<CString> = expanded_args
                 .iter()
                 .map(|arg| CString::new(arg.clone()).unwrap())
                 .collect();
@@ -80,6 +178,70 @@ fn execute_simple(
         }
         Err(e) => Err(ExecError::Nix(e)),
     }
+}
+
+fn expand_arg(arg: &str, state: &ShellState) -> String {
+    let mut result = String::new();
+    let mut chars = arg.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '$' {
+            if let Some(&next) = chars.peek() {
+                if next == '?' {
+                    chars.next();
+                    result.push_str(&state.last_exit_code.to_string());
+                } else if next == '{' {
+                    chars.next(); // consume '{'
+                    let mut var_name = String::new();
+                    let mut closed = false;
+                    while let Some(c) = chars.next() {
+                        if c == '}' {
+                            closed = true;
+                            break;
+                        }
+                        var_name.push(c);
+                    }
+                    if closed {
+                        if let Some(val) = state.get_env(&var_name) {
+                            result.push_str(val);
+                        } else if let Some(val) = state.vars.get(&var_name) {
+                            result.push_str(val);
+                        }
+                    } else {
+                        // Malformed ${... , treats as literal for now or error?
+                        // Bash behavior checks validity.
+                        // Let's just push what we have so far for simplicity/debug
+                        result.push_str("${");
+                        result.push_str(&var_name);
+                    }
+                } else if next.is_alphabetic() || next == '_' {
+                    // $VAR case
+                    let mut var_name = String::new();
+                    while let Some(&c) = chars.peek() {
+                        if c.is_alphanumeric() || c == '_' {
+                            var_name.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Some(val) = state.get_env(&var_name) {
+                        result.push_str(val);
+                    } else if let Some(val) = state.vars.get(&var_name) {
+                        result.push_str(val);
+                    }
+                } else {
+                    // Just a $ followed by something else (e.g. whitespace, or nothing)
+                    result.push('$');
+                }
+            } else {
+                // Trailing $
+                result.push('$');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 fn execute_pipeline(cmds: &[Command], _state: &mut ShellState) -> Result<i32, ExecError> {
@@ -200,4 +362,49 @@ fn handle_redirect(redirect: &Redirect) -> Result<(), ExecError> {
     unsafe { libc::close(fd) };
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ShellState;
+
+    #[test]
+    fn test_expand_arg_basic() {
+        let mut state = ShellState::new();
+        state.env.insert("VAR".to_string(), "hello".to_string());
+
+        assert_eq!(expand_arg("echo", &state), "echo");
+        assert_eq!(expand_arg("$VAR", &state), "hello");
+        assert_eq!(expand_arg("${VAR}", &state), "hello");
+        assert_eq!(expand_arg("prefix$VAR", &state), "prefixhello");
+        assert_eq!(expand_arg("${VAR}suffix", &state), "hellosuffix");
+    }
+
+    #[test]
+    fn test_expand_arg_missing() {
+        let state = ShellState::new();
+        assert_eq!(expand_arg("$MISSING", &state), "");
+        assert_eq!(expand_arg("${MISSING}", &state), "");
+    }
+
+    #[test]
+    fn test_expand_arg_special() {
+        let mut state = ShellState::new();
+        state.last_exit_code = 123;
+        assert_eq!(expand_arg("$?", &state), "123");
+    }
+
+    #[test]
+    fn test_expand_arg_multiple() {
+        let mut state = ShellState::new();
+        state.env.insert("A".to_string(), "1".to_string());
+        state.env.insert("B".to_string(), "2".to_string());
+        assert_eq!(expand_arg("$A-$B", &state), "1-2");
+    }
+
+    // Mock execution tests would be ideal here, but 'execute' forks.
+    // We can't easily test 'execute' logic in unit tests without extensive mocking or refactoring 'execute' to rely on a trait for system calls.
+    // However, we can test 'expand_arg' and verifying parser AST is correct (already done in parser.rs).
+    // For now, manual verification is key, or integration tests running the binary.
 }
