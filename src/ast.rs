@@ -51,14 +51,14 @@ pub struct Redirect {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RedirectOp {
-    Output,      // >
-    Input,       // <
-    Append,      // >>
-    DupOutput,   // >&
-    DupInput,    // <&
-    ForceOutput, // >| (clobber)
-    HereDoc,     // <<
-    HereString,  // <<<
+    Input,      // <
+    Output,     // >
+    Append,     // >>
+    HereDoc,    // <<
+    HereString, // <<<
+    DupOut,     // >&
+    DupIn,      // <&
+    AndOutput,  // &> (stdout and stderr)
 }
 
 #[derive(Debug, Clone, PartialEq)]

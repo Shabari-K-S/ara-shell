@@ -103,19 +103,33 @@ impl<'a> Lexer<'a> {
                 self.advance_char();
                 let op = c.to_string();
 
-                // Check for double operators: ||, &&, >>, <<
+                // Check for double/triple operators: ||, &&, >>, <<, <<<, >&, <&, &>
                 if let Some(next_c) = self.peek_char() {
-                    let combined = match (c, next_c) {
-                        ('|', '|') => Some("||"),
-                        ('&', '&') => Some("&&"),
-                        ('>', '>') => Some(">>"),
-                        ('<', '<') => Some("<<"),
+                    let mut combined = match (c, next_c) {
+                        ('|', '|') => Some("||".to_string()),
+                        ('&', '&') => Some("&&".to_string()),
+                        ('>', '>') => Some(">>".to_string()),
+                        ('<', '<') => Some("<<".to_string()), // Start of << or <<<
+                        ('>', '&') => Some(">&".to_string()),
+                        ('<', '&') => Some("<&".to_string()),
+                        ('&', '>') => Some("&>".to_string()),
                         _ => None,
                     };
 
-                    if let Some(combined_op) = combined {
+                    if let Some(ref val) = combined {
                         self.advance_char();
-                        return Ok(Token::Operator(combined_op.to_string()));
+
+                        // Check for triple operator <<<
+                        if val == "<<" {
+                            if let Some(third_c) = self.peek_char() {
+                                if third_c == '<' {
+                                    self.advance_char();
+                                    combined = Some("<<<".to_string());
+                                }
+                            }
+                        }
+
+                        return Ok(Token::Operator(combined.unwrap()));
                     }
                 }
                 Ok(Token::Operator(op))
@@ -129,6 +143,79 @@ impl<'a> Lexer<'a> {
                     self.advance_char();
                 }
                 self.next_token()
+            }
+            '0'..='9' => {
+                // Check if it's IoNumber (digit followed immediately by < or >)
+                // We need to look ahead to see if it's just digits then op, or mixed word.
+                // But simplified:
+                // 1. Consume digits.
+                // 2. Peek next. If < or >, valid IoNumber.
+                // 3. If other word char, treat as word.
+
+                let mut num_str = String::new();
+
+                // We know first char is digit
+                while let Some(pc) = self.peek_char() {
+                    if pc.is_digit(10) {
+                        num_str.push(self.advance_char().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+
+                // Now peek next
+                if let Some(next_c) = self.peek_char() {
+                    if next_c == '<' || next_c == '>' {
+                        // It IS an IoNumber!
+                        // e.g. "2>"
+                        return Ok(Token::IoNumber(num_str.parse().unwrap()));
+                    } else if next_c.is_whitespace() || ";|&".contains(next_c) || next_c == ')' {
+                        // Just a number word: "echo 123"
+                        return Ok(Token::Word(num_str));
+                    }
+                } else {
+                    // EOF after number
+                    return Ok(Token::Word(num_str));
+                }
+
+                // If we are here, it means we hit something else, e.g. "123a"
+                // Fallback to word parsing.
+                // Reset state? We consumed digits.
+                // Continue parsing as word.
+                let mut word = num_str;
+                while let Some(c) = self.peek_char() {
+                    if c.is_whitespace() || ";|&<>()".contains(c) {
+                        break;
+                    }
+                    if c == '\'' || c == '"' {
+                        // Quotes in word starting with digit
+                        let quote = self.advance_char().unwrap();
+                        if self.preserve_quotes {
+                            word.push(quote);
+                        }
+                        loop {
+                            match self.advance_char() {
+                                Some(qc) => {
+                                    if qc == quote {
+                                        if self.preserve_quotes {
+                                            word.push(qc);
+                                        }
+                                        break;
+                                    }
+                                    word.push(qc);
+                                }
+                                None => {
+                                    return Err(ShellError::Syntax(
+                                        "Unterminated quote".to_string(),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        word.push(self.advance_char().unwrap());
+                    }
+                }
+                Ok(Token::Word(word))
             }
             _ => {
                 // Word
@@ -168,6 +255,41 @@ impl<'a> Lexer<'a> {
             }
         }
     }
+
+    pub fn read_heredoc(&mut self, delimiter: &str) -> String {
+        let mut content = String::new();
+
+        // Skip current line logic (advance until newline)
+        // Only if we haven't consumed it yet?
+        // We assume we are called when parser is at Newline token.
+        // So Lexer pos is at start of next line.
+        // However, if there is trailing whitespace? Lexer skips whitespace in next_token.
+        // But read_heredoc operates on raw input.
+
+        loop {
+            if self.pos >= self.input.len() {
+                break;
+            }
+
+            let remaining = &self.input[self.pos..];
+            let end_idx = remaining
+                .find('\n')
+                .map(|i| i + self.pos)
+                .unwrap_or(self.input.len());
+            let line = &self.input[self.pos..end_idx];
+
+            if line == delimiter {
+                self.pos = end_idx + 1;
+                break;
+            }
+
+            content.push_str(line);
+            content.push('\n');
+            self.pos = end_idx + 1;
+        }
+
+        content
+    }
 }
 
 pub struct Parser<'a> {
@@ -190,6 +312,11 @@ impl<'a> Parser<'a> {
     }
 
     pub fn parse(&mut self) -> Result<Option<Command>, ShellError> {
+        // Skip leading newlines
+        while matches!(self.current_token, Token::Newline) {
+            self.advance()?;
+        }
+
         if let Token::EOF = self.current_token {
             return Ok(None);
         }
@@ -448,9 +575,11 @@ impl<'a> Parser<'a> {
     fn parse_simple_command(&mut self) -> Result<Command, ShellError> {
         let mut args = Vec::new();
         let mut redirects = Vec::new();
+        // Track indices of HereDoc redirects to process content later
+        let mut heredoc_indices: Vec<usize> = Vec::new();
 
         loop {
-            match &self.current_token {
+            match self.current_token.clone() {
                 Token::Word(w) => {
                     // Check for function def start: name ( )
                     if args.is_empty() && redirects.is_empty() {
@@ -485,35 +614,118 @@ impl<'a> Parser<'a> {
                         continue;
                     }
 
-                    args.push(w.clone());
+                    args.push(w);
                     self.advance()?;
                 }
-                Token::Operator(op) if op == "<" || op == ">" || op == ">>" => {
+
+                Token::IoNumber(fd) => {
+                    // Lexer guarantees that IoNumber is followed by < or >.
+                    // Consumes IoNumber -> current is Operator
+                    self.advance()?;
+
+                    if let Token::Operator(op) = &self.current_token {
+                        if matches!(
+                            op.as_str(),
+                            "<" | ">" | ">>" | "<<" | "<<<" | ">&" | "<&" | "&>"
+                        ) {
+                            let op_enum = match op.as_str() {
+                                "<" => crate::ast::RedirectOp::Input,
+                                ">" => crate::ast::RedirectOp::Output,
+                                ">>" => crate::ast::RedirectOp::Append,
+                                "<<" => crate::ast::RedirectOp::HereDoc,
+                                "<<<" => crate::ast::RedirectOp::HereString,
+                                ">&" => crate::ast::RedirectOp::DupOut,
+                                "<&" => crate::ast::RedirectOp::DupIn,
+                                "&>" => crate::ast::RedirectOp::AndOutput,
+                                _ => unreachable!(),
+                            };
+
+                            self.advance()?; // Consumes Operator -> current is Target
+
+                            if let Token::Word(target) = &self.current_token {
+                                redirects.push(Redirect {
+                                    fd,
+                                    op: op_enum.clone(),
+                                    target: target.clone(),
+                                });
+
+                                if op_enum == crate::ast::RedirectOp::HereDoc {
+                                    heredoc_indices.push(redirects.len() - 1);
+                                }
+
+                                self.advance()?;
+                            } else {
+                                return Err(ShellError::Syntax(
+                                    "Expected filename/delimiter after redirection".to_string(),
+                                ));
+                            }
+                            continue;
+                        }
+                    }
+                    // Fallback
+                    args.push(fd.to_string());
+                    continue;
+                }
+                Token::Operator(op)
+                    if matches!(
+                        op.as_str(),
+                        "<" | ">" | ">>" | "<<" | "<<<" | ">&" | "<&" | "&>"
+                    ) =>
+                {
                     let op_enum = match op.as_str() {
                         "<" => crate::ast::RedirectOp::Input,
                         ">" => crate::ast::RedirectOp::Output,
                         ">>" => crate::ast::RedirectOp::Append,
+                        "<<" => crate::ast::RedirectOp::HereDoc,
+                        "<<<" => crate::ast::RedirectOp::HereString,
+                        ">&" => crate::ast::RedirectOp::DupOut,
+                        "<&" => crate::ast::RedirectOp::DupIn,
+                        "&>" => crate::ast::RedirectOp::AndOutput,
                         _ => unreachable!(),
                     };
                     self.advance()?;
+
+                    // For HereDoc/HereString, target is the delimiter/string.
+                    // For Dup, target is FD number (as string).
+                    // For others, filename.
                     if let Token::Word(target) = &self.current_token {
                         redirects.push(Redirect {
-                            fd: if op_enum == crate::ast::RedirectOp::Input {
-                                0
-                            } else {
-                                1
+                            fd: match op_enum {
+                                crate::ast::RedirectOp::Input
+                                | crate::ast::RedirectOp::HereDoc
+                                | crate::ast::RedirectOp::HereString
+                                | crate::ast::RedirectOp::DupIn => 0,
+                                _ => 1,
                             },
-                            op: op_enum,
+                            op: op_enum.clone(),
                             target: target.clone(),
                         });
+
+                        if op_enum == crate::ast::RedirectOp::HereDoc {
+                            heredoc_indices.push(redirects.len() - 1);
+                        }
+
                         self.advance()?;
                     } else {
                         return Err(ShellError::Syntax(
-                            "Expected filename after redirection".to_string(),
+                            "Expected filename/delimiter after redirection".to_string(),
                         ));
                     }
                 }
                 _ => break,
+            }
+        }
+
+        // Process HereDocs if any
+        if !heredoc_indices.is_empty() {
+            for idx in heredoc_indices {
+                let delimiter = redirects[idx].target.clone();
+                let content = self.lexer.read_heredoc(&delimiter);
+                redirects[idx].target = content;
+            }
+
+            if matches!(self.current_token, Token::Newline) {
+                self.advance()?;
             }
         }
 
@@ -679,6 +891,43 @@ mod tests {
                 assert_eq!(name, "foo");
             }
             _ => panic!("Expected function def"),
+        }
+    }
+
+    #[test]
+    fn test_parser_heredoc() {
+        // "cat << EOF" -> RedirectOp::HereDoc with target "EOF"
+        // (Execution handles reading the content)
+        let input = "cat << EOF";
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer).unwrap();
+        let cmd = parser.parse().unwrap();
+
+        match cmd {
+            Some(Command::Simple { redirects, .. }) => {
+                assert_eq!(redirects.len(), 1);
+                assert_eq!(redirects[0].op, crate::ast::RedirectOp::HereDoc);
+                assert_eq!(redirects[0].target, "EOF");
+            }
+            _ => panic!("Expected simple command with heredoc"),
+        }
+    }
+
+    #[test]
+    fn test_parser_dup() {
+        let input = "ls 2>&1";
+        let lexer = Lexer::new(input);
+        let mut parser = Parser::new(lexer).unwrap();
+        let cmd = parser.parse().unwrap();
+
+        match cmd {
+            Some(Command::Simple { redirects, .. }) => {
+                assert_eq!(redirects.len(), 1);
+                assert_eq!(redirects[0].op, crate::ast::RedirectOp::DupOut);
+                assert_eq!(redirects[0].target, "1");
+                assert_eq!(redirects[0].fd, 2); // 2>&...
+            }
+            _ => panic!("Expected simple command with dup"),
         }
     }
 }

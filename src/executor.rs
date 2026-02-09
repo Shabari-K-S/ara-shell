@@ -4,7 +4,7 @@ use crate::state::ShellState;
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, execvp, fork, pipe};
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::process::exit;
 use thiserror::Error;
 
@@ -347,19 +347,84 @@ fn handle_redirect(redirect: &Redirect) -> Result<(), ExecError> {
     use std::fs::OpenOptions;
 
     // Simplified File Opening
-    let file = match redirect.op {
-        RedirectOp::Output => std::fs::File::create(&redirect.target)?,
-        RedirectOp::Input => std::fs::File::open(&redirect.target)?,
-        RedirectOp::Append => OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&redirect.target)?,
-        _ => return Ok(()), // TODO
-    };
+    match redirect.op {
+        RedirectOp::Output => {
+            let file = std::fs::File::create(&redirect.target)?;
+            let fd = file.into_raw_fd();
+            unsafe { libc::dup2(fd, redirect.fd) };
+            unsafe { libc::close(fd) };
+        }
+        RedirectOp::Input => {
+            let file = std::fs::File::open(&redirect.target)?;
+            let fd = file.into_raw_fd();
+            unsafe { libc::dup2(fd, redirect.fd) };
+            unsafe { libc::close(fd) };
+        }
+        RedirectOp::Append => {
+            let file = OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&redirect.target)?;
+            let fd = file.into_raw_fd();
+            unsafe { libc::dup2(fd, redirect.fd) };
+            unsafe { libc::close(fd) };
+        }
+        RedirectOp::DupOut | RedirectOp::DupIn => {
+            // target is FD number, e.g. "1" or "2", or "-" to close
+            if redirect.target == "-" {
+                unsafe { libc::close(redirect.fd) };
+            } else if let Ok(target_fd) = redirect.target.parse::<i32>() {
+                unsafe { libc::dup2(target_fd, redirect.fd) };
+            } else {
+                return Err(ExecError::General(format!(
+                    "Invalid FD for duplication: {}",
+                    redirect.target
+                )));
+            }
+        }
+        RedirectOp::AndOutput => {
+            // &> file  ==> > file 2>&1
+            // First open file and dup to stdout (1)
+            let file = std::fs::File::create(&redirect.target)?;
+            let fd = file.into_raw_fd();
+            unsafe { libc::dup2(fd, 1) };
+            unsafe { libc::close(fd) };
+            // Then dup stdout (1) to stderr (2)
+            unsafe { libc::dup2(1, 2) };
+        }
+        RedirectOp::HereString => {
+            // Create a pipe
+            let (read_end, write_end) = pipe()?;
 
-    let fd = file.into_raw_fd();
-    unsafe { libc::dup2(fd, redirect.fd) };
-    unsafe { libc::close(fd) };
+            // Write string to pipe
+            // Need to write in a way that doesn't block if buffer is full?
+            // For small strings it's fine. For large ones, might need thread.
+            // Using a simple write for now.
+            use std::io::Write;
+            let mut file = unsafe { std::fs::File::from_raw_fd(write_end.into_raw_fd()) };
+            write!(file, "{}\n", redirect.target)?; // Here-strings usually append newline
+            drop(file); // closes write end
+
+            let read_fd = read_end.into_raw_fd();
+            unsafe { libc::dup2(read_fd, redirect.fd) }; // usually 0
+            unsafe { libc::close(read_fd) };
+        }
+        RedirectOp::HereDoc => {
+            // Same as HereString but target contains the multiline content
+            // Parser should have already collected the content into 'target'
+            // (If we implemented inline parsing properly)
+            // For now assuming 'target' IS the content.
+            let (read_end, write_end) = pipe()?;
+            use std::io::Write;
+            let mut file = unsafe { std::fs::File::from_raw_fd(write_end.into_raw_fd()) };
+            write!(file, "{}", redirect.target)?;
+            drop(file);
+
+            let read_fd = read_end.into_raw_fd();
+            unsafe { libc::dup2(read_fd, redirect.fd) };
+            unsafe { libc::close(read_fd) };
+        }
+    };
 
     Ok(())
 }

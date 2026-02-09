@@ -8,6 +8,50 @@ fn main() -> anyhow::Result<()> {
     // Initialize shell state
     let mut state = ShellState::new();
 
+    let args: Vec<String> = env::args().collect();
+    if args.len() > 1 {
+        // Run script
+        let path = &args[1];
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read script {}: {}", path, e))?;
+
+        let lexer = Lexer::new(&content);
+        let mut parser = match Parser::new(lexer) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error creating parser: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        loop {
+            match parser.parse() {
+                Ok(Some(command)) => {
+                    match execute(&command, &mut state) {
+                        Ok(code) => {
+                            state.last_exit_code = code;
+                        }
+                        Err(e) => {
+                            eprintln!("Error executing command: {}", e);
+                            // In scripts, some errors might abort? For now continue.
+                        }
+                    }
+                }
+                Ok(None) => break, // EOF
+                Err(e) => {
+                    eprintln!("Error parsing script: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        // Return last exit code
+        if state.last_exit_code != 0 {
+            std::process::exit(state.last_exit_code);
+        }
+        return Ok(());
+    }
+
     // Initialize Rustyline Editor with AuraHelper
     let mut rl = Editor::<AuraHelper, FileHistory>::new()?;
     rl.set_helper(Some(AuraHelper {}));
