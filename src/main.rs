@@ -56,8 +56,12 @@ fn main() -> anyhow::Result<()> {
     setup_shell_signals();
     state.options.interactive = true;
 
-    // Initialize Rustyline Editor with AuraHelper
-    let mut rl = Editor::<AuraHelper, FileHistory>::new()?;
+    // Initialize Rustyline Editor with AuraHelper and Ctrl+R history search
+    let config = rustyline::config::Config::builder()
+        .edit_mode(rustyline::config::EditMode::Emacs)
+        .auto_add_history(false) // We add manually for control
+        .build();
+    let mut rl = Editor::<AuraHelper, FileHistory>::with_config(config)?;
     let completer = rustyline::completion::FilenameCompleter::new();
     rl.set_helper(Some(AuraHelper { completer }));
 

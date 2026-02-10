@@ -128,7 +128,10 @@ fn execute_simple(
     for arg in args {
         match arg {
             crate::ast::Arg::Literal(s) => {
-                expanded_args.push(expand_arg(s, state));
+                let expanded = expand_arg(s, state);
+                // Try glob expansion on the result
+                let globbed = expand_glob(&expanded);
+                expanded_args.extend(globbed);
             }
             crate::ast::Arg::ProcessSub { cmd, direction } => {
                 let (read_end, write_end) = pipe()?;
@@ -259,10 +262,54 @@ fn execute_simple(
     }
 }
 
+fn expand_tilde(arg: &str, state: &ShellState) -> String {
+    if arg == "~" {
+        // Bare ~ → $HOME
+        if let Some(home) = state.get_env("HOME") {
+            return home.clone();
+        }
+        return arg.to_string();
+    }
+    if let Some(rest) = arg.strip_prefix("~/") {
+        // ~/path → $HOME/path
+        if let Some(home) = state.get_env("HOME") {
+            return format!("{}/{}", home, rest);
+        }
+    }
+    arg.to_string()
+}
+
+fn expand_glob(arg: &str) -> Vec<String> {
+    // Only attempt glob if the arg contains metacharacters
+    if arg.contains('*') || arg.contains('?') || arg.contains('[') {
+        match glob::glob(arg) {
+            Ok(paths) => {
+                let mut results: Vec<String> = paths
+                    .filter_map(|p| p.ok())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .collect();
+                if results.is_empty() {
+                    // No matches — return the original pattern (bash default)
+                    vec![arg.to_string()]
+                } else {
+                    results.sort();
+                    results
+                }
+            }
+            Err(_) => vec![arg.to_string()],
+        }
+    } else {
+        vec![arg.to_string()]
+    }
+}
+
 fn expand_arg(arg: &str, state: &ShellState) -> String {
+    // Step 1: Tilde expansion
+    let arg = expand_tilde(arg, state);
     let mut result = String::new();
     let mut chars = arg.chars().peekable();
 
+    // Step 2: Variable expansion
     while let Some(c) = chars.next() {
         if c == '$' {
             if let Some(&next) = chars.peek() {
@@ -287,14 +334,10 @@ fn expand_arg(arg: &str, state: &ShellState) -> String {
                             result.push_str(val);
                         }
                     } else {
-                        // Malformed ${... , treats as literal for now or error?
-                        // Bash behavior checks validity.
-                        // Let's just push what we have so far for simplicity/debug
                         result.push_str("${");
                         result.push_str(&var_name);
                     }
                 } else if next.is_alphabetic() || next == '_' {
-                    // $VAR case
                     let mut var_name = String::new();
                     while let Some(&c) = chars.peek() {
                         if c.is_alphanumeric() || c == '_' {
@@ -309,11 +352,9 @@ fn expand_arg(arg: &str, state: &ShellState) -> String {
                         result.push_str(val);
                     }
                 } else {
-                    // Just a $ followed by something else (e.g. whitespace, or nothing)
                     result.push('$');
                 }
             } else {
-                // Trailing $
                 result.push('$');
             }
         } else {

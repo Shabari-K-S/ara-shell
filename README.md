@@ -11,7 +11,7 @@
 
 ### ✨ Interactive Experience (Phase 3 Complete)
 - **Syntax Highlighting**: Real-time coloring of commands (Green), operators (Cyan), and strings.
-- **Smart History**: Persisted command history (`~/.aura_history`) with Up/Down navigation.
+- **Smart History**: Persisted command history (`~/.aura_history`) with Up/Down navigation and **Ctrl+R** reverse search.
 - **Tab Completion**: Auto-completion for file and directory names.
 - **Line Editing**: Full line editing capabilities powered by `rustyline`.
 
@@ -21,6 +21,8 @@
 - **Built-ins**: `cd`, `exit`, `export`, `unset`.
 - **Quote Handling**: Correctly handles single (`'`) and double (`"`) quotes.
 - **Variables**: Environment variable management (`export`, `unset`) and parameter expansion (`$VAR`, `${VAR}`, `$?`).
+- **Tilde Expansion**: `~` expands to home directory (`~/Projects` → `/home/user/Projects`).
+- **Glob Expansion**: Wildcard patterns (`*.rs`, `src/*`, `?.toml`) expand to matching files.
 - **Flow Control**: `if`/`else` conditionals, `while`/`for` loops, and function definitions.
 - **Job Control**: Background processes (`&`), `jobs`, `fg`, `bg` builtins, signal handling.
 

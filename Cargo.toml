@@ -8,4 +8,5 @@ anyhow = "1.0.101"
 libc = "0.2.180"
 nix = { version = "0.31.1", features = ["process", "signal", "fs"] }
 rustyline = "17.0.2"
+glob = "0.3"
 thiserror = "2.0.18"
