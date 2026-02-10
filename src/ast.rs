@@ -4,7 +4,7 @@
 pub enum Command {
     // A simple command: "ls -la"
     Simple {
-        args: Vec<String>,
+        args: Vec<Arg>,
         redirects: Vec<Redirect>,
         assignments: Vec<Assignment>,
     },
@@ -69,8 +69,96 @@ pub struct Assignment {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlOp {
-    And,   // &&
-    Or,    // ||
-    Semi,  // ;
+    And,  // &&
+    Or,   // ||
+    Semi, // ;
+
     Async, // &
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Arg {
+    Literal(String),
+    ProcessSub {
+        cmd: Box<Command>,
+        direction: ProcessSubKind, // Input <() or Output >()
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProcessSubKind {
+    Read,  // <(cmd)
+    Write, // >(cmd)
+}
+
+// --- Display implementations for human-readable job output ---
+
+impl std::fmt::Display for Arg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Arg::Literal(s) => write!(f, "{}", s),
+            Arg::ProcessSub { cmd, direction } => {
+                let prefix = match direction {
+                    ProcessSubKind::Read => "<",
+                    ProcessSubKind::Write => ">",
+                };
+                write!(f, "{}({})", prefix, cmd)
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Command::Simple { args, .. } => {
+                let parts: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+                write!(f, "{}", parts.join(" "))
+            }
+            Command::Pipeline(cmds) => {
+                let parts: Vec<String> = cmds.iter().map(|c| c.to_string()).collect();
+                write!(f, "{}", parts.join(" | "))
+            }
+            Command::List { left, op, right } => {
+                let op_str = match op {
+                    ControlOp::And => "&&",
+                    ControlOp::Or => "||",
+                    ControlOp::Semi => ";",
+                    ControlOp::Async => "&",
+                };
+                write!(f, "{} {} {}", left, op_str, right)
+            }
+            Command::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                write!(f, "if {}; then {}", condition, then_body)?;
+                if let Some(eb) = else_body {
+                    write!(f, "; else {}", eb)?;
+                }
+                write!(f, "; fi")
+            }
+            Command::While { condition, body } => {
+                write!(f, "while {}; do {}; done", condition, body)
+            }
+            Command::For {
+                variable,
+                items,
+                body,
+            } => {
+                write!(
+                    f,
+                    "for {} in {}; do {}; done",
+                    variable,
+                    items.join(" "),
+                    body
+                )
+            }
+            Command::FunctionDef { name, body } => {
+                write!(f, "{}() {{ {} }}", name, body)
+            }
+            Command::Subshell(cmd) => write!(f, "({})", cmd),
+        }
+    }
 }

@@ -12,6 +12,7 @@
 ### ✨ Interactive Experience (Phase 3 Complete)
 - **Syntax Highlighting**: Real-time coloring of commands (Green), operators (Cyan), and strings.
 - **Smart History**: Persisted command history (`~/.aura_history`) with Up/Down navigation.
+- **Tab Completion**: Auto-completion for file and directory names.
 - **Line Editing**: Full line editing capabilities powered by `rustyline`.
 
 ### 🛠️ Shell Capabilities
@@ -21,6 +22,7 @@
 - **Quote Handling**: Correctly handles single (`'`) and double (`"`) quotes.
 - **Variables**: Environment variable management (`export`, `unset`) and parameter expansion (`$VAR`, `${VAR}`, `$?`).
 - **Flow Control**: `if`/`else` conditionals, `while`/`for` loops, and function definitions.
+- **Job Control**: Background processes (`&`), `jobs`, `fg`, `bg` builtins, signal handling.
 
 ## Installation & Usage
 
@@ -66,6 +68,11 @@ for i in 1 2 3; do echo $i; done
 # Functions
 greet() { echo "Hello $1"; }
 greet World
+
+# Background jobs
+sleep 10 &
+jobs
+fg %1
 ```
 
 ## Roadmap
@@ -95,12 +102,12 @@ The development of Aura follows a structured 10-phase plan to deliver a complete
     - [x] Loops (`for`, `while`).
     - [x] Function definitions.
 
-- [ ] **Phase 6: Advanced I/O & Redirections**
+- [x] **Phase 6: Advanced I/O & Redirections**
     - Here-documents (`<<EOF`) and Here-strings (`<<<`).
     - File descriptor duplication (`2>&1`).
     - Process substitution (`<(cmd)`).
 
-- [ ] **Phase 7: Job Control & Signal Handling**
+- [x] **Phase 7: Job Control & Signal Handling**
     - Background process management (`&`).
     - Job control built-ins (`jobs`, `fg`, `bg`).
     - Signal trapping (`trap`) and Ctrl-C/Z handling.

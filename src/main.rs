@@ -1,4 +1,4 @@
-use ara::{AuraHelper, Lexer, Parser, ShellState, execute};
+use ara::{AuraHelper, Lexer, Parser, ShellState, execute, setup_shell_signals};
 use rustyline::Editor;
 use rustyline::error::ReadlineError;
 use rustyline::history::FileHistory;
@@ -52,9 +52,14 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Setup signal handling for interactive mode
+    setup_shell_signals();
+    state.options.interactive = true;
+
     // Initialize Rustyline Editor with AuraHelper
     let mut rl = Editor::<AuraHelper, FileHistory>::new()?;
-    rl.set_helper(Some(AuraHelper {}));
+    let completer = rustyline::completion::FilenameCompleter::new();
+    rl.set_helper(Some(AuraHelper { completer }));
 
     // Load history
     // Get home directory for history file
@@ -64,6 +69,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     loop {
+        // Reap completed background jobs and print notifications
+        let notifications = state.reap_jobs();
+        for (id, cmd, status) in &notifications {
+            eprintln!("[{}]+ {}  {}", id, status, cmd);
+        }
+
         // Display prompt
         let cwd = state.cwd.file_name().unwrap_or_default().to_string_lossy();
         let prompt = format!("\x1b[1;32maura\x1b[0m \x1b[1;36m{}\x1b[0m $ ", cwd);

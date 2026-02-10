@@ -1,5 +1,7 @@
+use rustyline::Context;
 use rustyline::Helper;
-use rustyline::completion::Completer;
+use rustyline::Result;
+use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::validate::Validator;
@@ -7,20 +9,38 @@ use std::borrow::Cow;
 
 use crate::parser::{Lexer, Token};
 
-#[derive(Debug)]
 pub struct AuraHelper {
-    // We can add state here if needed
+    pub completer: FilenameCompleter,
 }
 
 impl Completer for AuraHelper {
-    type Candidate = String;
+    type Candidate = Pair;
+
+    fn complete(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Result<(usize, Vec<Pair>)> {
+        self.completer.complete(line, pos, ctx)
+    }
 }
 
 impl Hinter for AuraHelper {
     type Hint = String;
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
 }
 
-impl Validator for AuraHelper {}
+impl Validator for AuraHelper {
+    fn validate(
+        &self,
+        _ctx: &mut rustyline::validate::ValidationContext,
+    ) -> Result<rustyline::validate::ValidationResult> {
+        // self.validator.validate(ctx)
+        Ok(rustyline::validate::ValidationResult::Valid(None))
+    }
+
+    fn validate_while_typing(&self) -> bool {
+        false
+    }
+}
 
 impl Helper for AuraHelper {}
 

@@ -113,6 +113,8 @@ impl<'a> Lexer<'a> {
                         ('>', '&') => Some(">&".to_string()),
                         ('<', '&') => Some("<&".to_string()),
                         ('&', '>') => Some("&>".to_string()),
+                        ('<', '(') => Some("<(".to_string()), // Process Sub <(...)
+                        ('>', '(') => Some(">(".to_string()), // Process Sub >(...)
                         _ => None,
                     };
 
@@ -278,14 +280,20 @@ impl<'a> Lexer<'a> {
                 .unwrap_or(self.input.len());
             let line = &self.input[self.pos..end_idx];
 
+            let next_pos = if end_idx == self.input.len() {
+                self.input.len()
+            } else {
+                end_idx + 1
+            };
+
             if line == delimiter {
-                self.pos = end_idx + 1;
+                self.pos = next_pos;
                 break;
             }
 
             content.push_str(line);
             content.push('\n');
-            self.pos = end_idx + 1;
+            self.pos = next_pos;
         }
 
         content
@@ -340,7 +348,24 @@ impl<'a> Parser<'a> {
 
                 // Check for terminators or EOF
                 if matches!(self.current_token, Token::EOF) || self.is_terminator() {
+                    // For `&`, we still need to wrap in a List to trigger backgrounding
+                    if op_enum == crate::ast::ControlOp::Async {
+                        return Ok(Command::List {
+                            left: Box::new(left),
+                            op: op_enum,
+                            right: Box::new(Command::Simple {
+                                args: vec![],
+                                redirects: vec![],
+                                assignments: vec![],
+                            }),
+                        });
+                    }
                     return Ok(left);
+                }
+
+                // Skip newlines before parsing right side
+                while matches!(self.current_token, Token::Newline) {
+                    self.advance()?;
                 }
 
                 let right = self.parse_list()?;
@@ -584,6 +609,54 @@ impl<'a> Parser<'a> {
                     // Check for function def start: name ( )
                     if args.is_empty() && redirects.is_empty() {
                         let name = w.clone();
+                        // Peek next token without consuming 'w' yet? No, we have 'w'.
+                        // Lexer prev state? We have 'current_token'.
+                        // We need to look ahead.
+                        // But we already consumed 'w' into current_token.
+                        // We need to peek *next* using parser.advance?
+                        // Parser doesn't support peeking easily without consuming.
+                        // But wait! Function def logic:
+                        // matches current_token == Word.
+
+                        // We need to check next token.
+                        // Is it `(`?
+                        // If so, it's a function.
+
+                        // But if we advance, we lose 'w' if it's NOT a function?
+                        // Actually, strict POSIX func def is `name ()`.
+                        // Parser should look ahead.
+                        // Implementation detail: we could consume `w`, check next.
+                        // If next is `(`, consume `(`.
+                        // If next is not `(`, then `w` is just an argument.
+
+                        // BUT: `w` is currently `current_token`.
+                        // We need to peek `lexer` for next token?
+                        // Or utilize a `peek` method on Parser?
+                        // Parser doesn't have `peek`.
+
+                        // Let's implement function check by peeking lexer directly?
+                        // Or just consume and if not `(`, push `w` as arg and continue with `next_token` as current?
+                        // Yes!
+
+                        // However, for now `parse` logic was:
+                        /*
+                        let name = w.clone();
+                        self.advance()?; // eat name
+                        if let Token::Operator(op) = &self.current_token { ... }
+                        */
+                        // This logic consumes `w`. If next isn't `(`, `w` is lost?
+                        // No, `args.push(name)` is the fallback!
+                        // The original code was:
+                        /*
+                        let name = w.clone();
+                        self.advance()?;
+                        if ... { return FunctionDef }
+                        args.push(name);
+                        continue;
+                        */
+                        // This assumes `args.push` happens if NOT function.
+                        // Correct.
+
                         self.advance()?; // eat name
 
                         // Check if next is '('
@@ -610,11 +683,11 @@ impl<'a> Parser<'a> {
                         }
 
                         // Not a function def
-                        args.push(name);
+                        args.push(crate::ast::Arg::Literal(name));
                         continue;
                     }
 
-                    args.push(w);
+                    args.push(crate::ast::Arg::Literal(w.clone()));
                     self.advance()?;
                 }
 
@@ -663,7 +736,7 @@ impl<'a> Parser<'a> {
                         }
                     }
                     // Fallback
-                    args.push(fd.to_string());
+                    args.push(crate::ast::Arg::Literal(fd.to_string()));
                     continue;
                 }
                 Token::Operator(op)
@@ -711,6 +784,33 @@ impl<'a> Parser<'a> {
                             "Expected filename/delimiter after redirection".to_string(),
                         ));
                     }
+                }
+                Token::Operator(op) if op == "<(" || op == ">(" => {
+                    let direction = if op == "<(" {
+                        crate::ast::ProcessSubKind::Read
+                    } else {
+                        crate::ast::ProcessSubKind::Write
+                    };
+
+                    self.advance()?; // eat <( or >(
+
+                    // Parse inner command list/pipeline
+                    // Note: <(cmd) usually allows a full list? Yes.
+                    let cmd = self.parse_list()?;
+
+                    match &self.current_token {
+                        Token::Operator(op) if op == ")" => self.advance()?,
+                        _ => {
+                            return Err(ShellError::Syntax(
+                                "Expected ')' closing process substitution".to_string(),
+                            ));
+                        }
+                    }
+
+                    args.push(crate::ast::Arg::ProcessSub {
+                        cmd: Box::new(cmd),
+                        direction,
+                    });
                 }
                 _ => break,
             }
@@ -794,7 +894,13 @@ mod tests {
 
         match cmd {
             Some(Command::Simple { args, .. }) => {
-                assert_eq!(args, vec!["ls", "-la"]);
+                assert_eq!(
+                    args,
+                    vec![
+                        crate::ast::Arg::Literal("ls".to_string()),
+                        crate::ast::Arg::Literal("-la".to_string())
+                    ]
+                );
             }
             _ => panic!("Expected simple command"),
         }
@@ -896,9 +1002,7 @@ mod tests {
 
     #[test]
     fn test_parser_heredoc() {
-        // "cat << EOF" -> RedirectOp::HereDoc with target "EOF"
-        // (Execution handles reading the content)
-        let input = "cat << EOF";
+        let input = "cat << EOF\ncontent\nEOF";
         let lexer = Lexer::new(input);
         let mut parser = Parser::new(lexer).unwrap();
         let cmd = parser.parse().unwrap();
@@ -907,7 +1011,8 @@ mod tests {
             Some(Command::Simple { redirects, .. }) => {
                 assert_eq!(redirects.len(), 1);
                 assert_eq!(redirects[0].op, crate::ast::RedirectOp::HereDoc);
-                assert_eq!(redirects[0].target, "EOF");
+                // Parser consumes content into target
+                assert_eq!(redirects[0].target, "content\n");
             }
             _ => panic!("Expected simple command with heredoc"),
         }

@@ -1,8 +1,9 @@
 use crate::ast::{Command, ControlOp, Redirect, RedirectOp};
 use crate::builtins::get_builtin;
+use crate::signals::restore_child_signals;
 use crate::state::ShellState;
 use nix::sys::wait::{WaitStatus, waitpid};
-use nix::unistd::{ForkResult, execvp, fork, pipe};
+use nix::unistd::{ForkResult, Pid, execvp, fork, pipe, setpgid};
 use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::process::exit;
@@ -111,7 +112,7 @@ fn execute_for(
 }
 
 fn execute_simple(
-    args: &[String],
+    args: &[crate::ast::Arg],
     redirects: &[Redirect],
     state: &mut ShellState,
 ) -> Result<i32, ExecError> {
@@ -119,20 +120,94 @@ fn execute_simple(
         return Ok(0);
     }
 
-    // Expand arguments
     let mut expanded_args = Vec::new();
+    let mut proc_sub_fds = Vec::new(); // Keep FDs open until command finishes
+    let mut proc_sub_pids = Vec::new(); // Subprocesses to wait for
+
+    // Expand arguments and setup process substitutions
     for arg in args {
-        expanded_args.push(expand_arg(arg, state));
+        match arg {
+            crate::ast::Arg::Literal(s) => {
+                expanded_args.push(expand_arg(s, state));
+            }
+            crate::ast::Arg::ProcessSub { cmd, direction } => {
+                let (read_end, write_end) = pipe()?;
+                match unsafe { fork() } {
+                    Ok(ForkResult::Parent { child, .. }) => {
+                        proc_sub_pids.push(child);
+
+                        match direction {
+                            crate::ast::ProcessSubKind::Read => {
+                                // <(cmd): cmd writes to pipe, parent reads from pipe
+                                // Parent (here) acts as consumer (reading)
+                                // We keep read_end open, close write_end
+                                drop(write_end);
+
+                                let fd = read_end.as_raw_fd();
+                                // /dev/fd/N is safer and standard on Linux
+                                expanded_args.push(format!("/dev/fd/{}", fd));
+                                proc_sub_fds.push(read_end);
+                            }
+                            crate::ast::ProcessSubKind::Write => {
+                                // >(cmd): cmd reads from pipe, parent writes to pipe
+                                // Parent (here) acts as producer (writing)
+                                // We keep write_end open, close read_end
+                                drop(read_end);
+
+                                let fd = write_end.as_raw_fd();
+                                expanded_args.push(format!("/dev/fd/{}", fd));
+                                proc_sub_fds.push(write_end);
+                            }
+                        }
+                    }
+                    Ok(ForkResult::Child) => {
+                        // Child executing the subcommand in the substitution
+                        match direction {
+                            crate::ast::ProcessSubKind::Read => {
+                                // Child writes to stdout
+                                drop(read_end);
+                                let fd = write_end.into_raw_fd();
+                                unsafe { libc::dup2(fd, 1) };
+                                unsafe { libc::close(fd) };
+                            }
+                            crate::ast::ProcessSubKind::Write => {
+                                // Child reads from stdin
+                                drop(write_end);
+                                let fd = read_end.into_raw_fd();
+                                unsafe { libc::dup2(fd, 0) };
+                                unsafe { libc::close(fd) };
+                            }
+                        }
+
+                        // Execute the subcommand
+                        match execute(cmd, state) {
+                            Ok(_) => exit(0),
+                            Err(_) => exit(1),
+                        }
+                    }
+                    Err(e) => return Err(ExecError::Nix(e)),
+                }
+            }
+        }
     }
 
     let program = &expanded_args[0];
 
+    // Helper to cleanup process substitutions
+    let mut cleanup = || {
+        // Drop the FDs to close them
+        proc_sub_fds.clear();
+        // Wait for substitution processes
+        for pid in &proc_sub_pids {
+            let _ = waitpid(*pid, None);
+        }
+    };
+
     // Check for functions
     if let Some(body) = state.functions.get(program).cloned() {
-        // Execute function body.
-        // TODO: Handle arguments ($1, $2...)
-        // For now just execute body with current state.
-        return match execute(&body, state) {
+        let result = execute(&body, state);
+        cleanup();
+        return match result {
             Ok(code) => Ok(code),
             Err(e) => Err(ExecError::General(e.to_string())),
         };
@@ -140,11 +215,12 @@ fn execute_simple(
 
     // Check for built-ins
     if let Some(builtin) = get_builtin(program) {
-        // TODO: Redirects for builtins? (Maybe later)
-        match builtin.execute(&expanded_args, state) {
-            Ok(code) => return Ok(code),
-            Err(e) => return Err(ExecError::General(e.to_string())),
-        }
+        let result = builtin.execute(&expanded_args, state);
+        cleanup();
+        return match result {
+            Ok(code) => Ok(code),
+            Err(e) => Err(ExecError::General(e.to_string())),
+        };
     }
 
     // External command
@@ -158,6 +234,9 @@ fn execute_simple(
             }
         }
         Ok(ForkResult::Child) => {
+            // Restore default signal handlers for child
+            restore_child_signals();
+
             // Handle redirects
             for redirect in redirects {
                 handle_redirect(redirect).unwrap_or_else(|e| {
@@ -244,7 +323,7 @@ fn expand_arg(arg: &str, state: &ShellState) -> String {
     result
 }
 
-fn execute_pipeline(cmds: &[Command], _state: &mut ShellState) -> Result<i32, ExecError> {
+fn execute_pipeline(cmds: &[Command], state: &mut ShellState) -> Result<i32, ExecError> {
     let mut input_fd: Option<OwnedFd> = None;
     let mut pids = Vec::new();
 
@@ -266,7 +345,8 @@ fn execute_pipeline(cmds: &[Command], _state: &mut ShellState) -> Result<i32, Ex
                 input_fd = read_end;
             }
             Ok(ForkResult::Child) => {
-                // Child specific handling
+                // Restore default signal handlers for child
+                restore_child_signals();
 
                 // If there is an input_fd from previous step, dup2 it to STDIN
                 if let Some(fd) = input_fd {
@@ -281,28 +361,12 @@ fn execute_pipeline(cmds: &[Command], _state: &mut ShellState) -> Result<i32, Ex
                 }
 
                 // Recursively execute command
-                if let Command::Simple {
-                    args, redirects: _, ..
-                } = cmd
-                {
-                    if args.is_empty() {
-                        exit(0);
+                match execute(cmd, state) {
+                    Ok(code) => exit(code),
+                    Err(e) => {
+                        eprintln!("Pipeline execution error: {}", e);
+                        exit(1);
                     }
-
-                    // TODO: handle redirects mixed with pipes
-
-                    let program = &args[0];
-                    let c_program = CString::new(program.clone()).unwrap();
-                    let c_args: Vec<CString> = args
-                        .iter()
-                        .map(|arg| CString::new(arg.clone()).unwrap())
-                        .collect();
-
-                    let _ = execvp(&c_program, &c_args);
-                    eprintln!("aura: command not found: {}", program);
-                    exit(127);
-                } else {
-                    exit(1);
                 }
             }
             Err(e) => return Err(ExecError::Nix(e)),
@@ -327,13 +391,42 @@ fn execute_list(
     right: &Command,
     state: &mut ShellState,
 ) -> Result<i32, ExecError> {
+    if *op == ControlOp::Async {
+        // Background the left command: fork, don't wait, register as job
+        // Build a display string for the command
+        let cmd_display = format!("{}", left);
+
+        match unsafe { fork() } {
+            Ok(ForkResult::Parent { child, .. }) => {
+                // Put child in its own process group
+                let _ = setpgid(child, child);
+                let job_id = state.add_job(child, cmd_display);
+                eprintln!("[{}] {}", job_id, child);
+
+                // Now execute the right side (if any)
+                return execute(right, state);
+            }
+            Ok(ForkResult::Child) => {
+                // Child: put self in own process group
+                let _ = setpgid(Pid::from_raw(0), Pid::from_raw(0));
+                restore_child_signals();
+
+                match execute(left, state) {
+                    Ok(code) => exit(code),
+                    Err(_) => exit(1),
+                }
+            }
+            Err(e) => return Err(ExecError::Nix(e)),
+        }
+    }
+
     let left_code = execute(left, state)?;
 
     let should_run = match op {
         ControlOp::And => left_code == 0,
         ControlOp::Or => left_code != 0,
         ControlOp::Semi => true,
-        ControlOp::Async => true, // TODO: Backgrounding logic
+        ControlOp::Async => unreachable!(), // handled above
     };
 
     if should_run {
